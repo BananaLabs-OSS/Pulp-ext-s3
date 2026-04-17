@@ -26,7 +26,10 @@
 //	  req: {key, body}
 //
 //	s3_presign(req_ptr, req_len, resp_ptr_out, resp_len_out) → code
-//	  req: {key, ttl_sec}; resp: {url}
+//	  req: {key, ttl_sec}; resp: {url}  — GET URL for downloads
+//
+//	s3_presign_put(req_ptr, req_len, resp_ptr_out, resp_len_out) → code
+//	  req: {key, ttl_sec}; resp: {url}  — PUT URL for direct uploads
 //
 //	s3_head(req_ptr, req_len, resp_ptr_out, resp_len_out) → code
 //	  req: {key}; resp: {size, last_modified_unix}
@@ -154,6 +157,7 @@ type deleteRequest struct {
 func bindActive(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 	b.NewFunctionBuilder().WithFunc(s3Put).Export("s3_put")
 	b.NewFunctionBuilder().WithFunc(s3Presign).Export("s3_presign")
+	b.NewFunctionBuilder().WithFunc(s3PresignPut).Export("s3_presign_put")
 	b.NewFunctionBuilder().WithFunc(s3Head).Export("s3_head")
 	b.NewFunctionBuilder().WithFunc(s3Copy).Export("s3_copy")
 	b.NewFunctionBuilder().WithFunc(s3Delete).Export("s3_delete")
@@ -161,11 +165,11 @@ func bindActive(b wazero.HostModuleBuilder, _ ext.Plugin) error {
 }
 
 func bindStub(b wazero.HostModuleBuilder, _ ext.Plugin) error {
-	// Same function names, matching signatures, all return error 99.
 	nop4 := func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }
 	nop2 := func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }
 	b.NewFunctionBuilder().WithFunc(nop2).Export("s3_put")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("s3_presign")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("s3_presign_put")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("s3_head")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("s3_copy")
 	b.NewFunctionBuilder().WithFunc(nop2).Export("s3_delete")
@@ -196,6 +200,35 @@ func s3Put(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 		return 4
 	}
 	return 0
+}
+
+func s3PresignPut(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req presignRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureClient(); err != nil {
+		return 10
+	}
+	ttl := time.Duration(req.TTLSec) * time.Second
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	psr, err := presig.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &req.Key,
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, presignResponse{URL: psr.URL}, respPtrOut, respLenOut)
 }
 
 func s3Presign(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {

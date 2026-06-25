@@ -90,6 +90,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -138,6 +139,21 @@ func init() {
 		Name:     "storage.s3",
 		Register: bindActive,
 		Stub:     bindStub,
+		Teardown: func(_ context.Context) error {
+			clientMu.Lock()
+			c := client
+			clientMu.Unlock()
+			if c == nil {
+				return nil
+			}
+			type idleCloser interface {
+				CloseIdleConnections()
+			}
+			if ic, ok := c.Options().HTTPClient.(idleCloser); ok {
+				ic.CloseIdleConnections()
+			}
+			return nil
+		},
 	})
 }
 
@@ -698,7 +714,7 @@ func s3Copy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if err := ensureClient(); err != nil {
 		return 10
 	}
-	copySource := bucket + "/" + req.SrcKey
+	copySource := bucket + "/" + url.PathEscape(req.SrcKey)
 	_, err := client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     &bucket,
 		CopySource: &copySource,

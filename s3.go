@@ -136,45 +136,147 @@ func classifyS3Error(err error) uint32 {
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:     "storage.s3",
-		Register: bindActive,
-		Stub:     bindStub,
-		Teardown: func(_ context.Context) error {
-			clientMu.Lock()
-			c := client
-			clientMu.Unlock()
-			if c == nil {
-				return nil
-			}
-			type idleCloser interface {
-				CloseIdleConnections()
-			}
-			if ic, ok := c.Options().HTTPClient.(idleCloser); ok {
-				ic.CloseIdleConnections()
-			}
-			return nil
-		},
+		Name:          "storage.s3",
+		Setup:         setup,
+		Register:      bindActive,
+		Stub:          bindStub,
+		Teardown:      teardown,
+		TeardownScope: teardownScope,
 	})
 }
 
 // ---- client setup --------------------------------------------------------
 
-var (
-	clientMu sync.Mutex
-	client   *s3.Client
-	presig   *s3.PresignClient
-	bucket   string
-	initErr  error
-)
+type s3ApplicationKey struct {
+	applicationID string
+	instanceID    string
+}
 
-func ensureClient() error {
-	clientMu.Lock()
-	defer clientMu.Unlock()
-	if client != nil {
+type s3ClientState struct {
+	mu      sync.Mutex
+	client  *s3.Client
+	presig  *s3.PresignClient
+	bucket  string
+	initErr error
+	closed  bool
+}
+
+type s3Manager struct {
+	mu      sync.Mutex
+	clients map[s3ApplicationKey]*s3ClientState
+}
+
+func newS3Manager() *s3Manager {
+	return &s3Manager{clients: map[s3ApplicationKey]*s3ClientState{}}
+}
+
+var manager = newS3Manager()
+
+func applicationKey(scope ext.Scope) s3ApplicationKey {
+	return s3ApplicationKey{applicationID: scope.ApplicationID(), instanceID: scope.ApplicationInstanceID()}
+}
+
+func setup(env ext.SetupEnv) error {
+	scope := env.EffectiveScope()
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("storage.s3: invalid setup scope: %w", err)
+	}
+	_, err := manager.setup(scope)
+	return err
+}
+
+func (m *s3Manager) setup(scope ext.Scope) (*s3ClientState, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	key := applicationKey(scope)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if state := m.clients[key]; state != nil {
+		return state, nil
+	}
+	state := &s3ClientState{}
+	m.clients[key] = state
+	return state, nil
+}
+
+func (m *s3Manager) forScope(scope ext.Scope) (*s3ClientState, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	key := applicationKey(scope)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if state := m.clients[key]; state != nil {
+		return state, nil
+	}
+	if !scope.IsLegacy() {
+		return nil, fmt.Errorf("storage.s3: setup not called for application %s/%s", key.applicationID, key.instanceID)
+	}
+	state := &s3ClientState{}
+	m.clients[key] = state
+	return state, nil
+}
+
+func teardown(_ context.Context) error {
+	return manager.teardown(ext.LegacyScope("default"))
+}
+
+func teardownScope(_ context.Context, scope ext.Scope) error {
+	return manager.teardown(scope)
+}
+
+func (m *s3Manager) teardown(scope ext.Scope) error {
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	key := applicationKey(scope)
+	m.mu.Lock()
+	state := m.clients[key]
+	delete(m.clients, key)
+	m.mu.Unlock()
+	if state == nil {
 		return nil
 	}
-	if initErr != nil {
-		return initErr
+	state.close()
+	return nil
+}
+
+func (s *s3ClientState) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	if s.client == nil {
+		return
+	}
+	type idleCloser interface{ CloseIdleConnections() }
+	if closer, ok := s.client.Options().HTTPClient.(idleCloser); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+func ensureClient() error {
+	state, err := manager.forScope(ext.LegacyScope("default"))
+	if err != nil {
+		return err
+	}
+	return state.ensureClient()
+}
+
+func (s *s3ClientState) ensureClient() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("s3: client scope is closed")
+	}
+	if s.client != nil {
+		return nil
+	}
+	if s.initErr != nil {
+		return s.initErr
 	}
 
 	accountID := os.Getenv("S3_ACCOUNT_ID")
@@ -189,20 +291,20 @@ func ensureClient() error {
 	if secretKey == "" {
 		secretKey = os.Getenv("R2_SECRET_ACCESS_KEY")
 	}
-	bucket = os.Getenv("S3_BUCKET")
-	if bucket == "" {
-		bucket = os.Getenv("R2_BUCKET")
+	s.bucket = os.Getenv("S3_BUCKET")
+	if s.bucket == "" {
+		s.bucket = os.Getenv("R2_BUCKET")
 	}
 	endpoint := os.Getenv("S3_ENDPOINT")
 
-	if accessKey == "" || secretKey == "" || bucket == "" {
-		initErr = fmt.Errorf("s3: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET all required")
-		return initErr
+	if accessKey == "" || secretKey == "" || s.bucket == "" {
+		s.initErr = fmt.Errorf("s3: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET all required")
+		return s.initErr
 	}
 	if endpoint == "" {
 		if accountID == "" {
-			initErr = fmt.Errorf("s3: set either S3_ENDPOINT or S3_ACCOUNT_ID")
-			return initErr
+			s.initErr = fmt.Errorf("s3: set either S3_ENDPOINT or S3_ACCOUNT_ID")
+			return s.initErr
 		}
 		endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
 	}
@@ -211,11 +313,11 @@ func ensureClient() error {
 		Region:      "auto",
 		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
 	}
-	client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+	s.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = &endpoint
 		o.UsePathStyle = true
 	})
-	presig = s3.NewPresignClient(client)
+	s.presig = s3.NewPresignClient(s.client)
 	return nil
 }
 
@@ -325,20 +427,38 @@ type listResponse struct {
 	IsTruncated           bool        `msgpack:"is_truncated"`
 }
 
-func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
-	b.NewFunctionBuilder().WithFunc(s3Put).Export("s3_put")
-	b.NewFunctionBuilder().WithFunc(s3PutSized).Export("s3_put_sized")
-	b.NewFunctionBuilder().WithFunc(s3PutMultipartInit).Export("s3_put_multipart_init")
-	b.NewFunctionBuilder().WithFunc(s3PutMultipartPart).Export("s3_put_multipart_part")
-	b.NewFunctionBuilder().WithFunc(s3PutMultipartComplete).Export("s3_put_multipart_complete")
-	b.NewFunctionBuilder().WithFunc(s3PutMultipartAbort).Export("s3_put_multipart_abort")
-	b.NewFunctionBuilder().WithFunc(s3Presign).Export("s3_presign")
-	b.NewFunctionBuilder().WithFunc(s3PresignPut).Export("s3_presign_put")
-	b.NewFunctionBuilder().WithFunc(s3Head).Export("s3_head")
-	b.NewFunctionBuilder().WithFunc(s3Get).Export("s3_get")
-	b.NewFunctionBuilder().WithFunc(s3Copy).Export("s3_copy")
-	b.NewFunctionBuilder().WithFunc(s3Delete).Export("s3_delete")
-	b.NewFunctionBuilder().WithFunc(s3List).Export("s3_list")
+func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	scope, err := ext.ValidatedScopeOf(cell)
+	if err != nil {
+		return fmt.Errorf("storage.s3: resolve cell scope: %w", err)
+	}
+	state, err := manager.forScope(scope)
+	if err != nil {
+		return err
+	}
+	nop2 := func(call func(context.Context, *s3ClientState, api.Module, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32) uint32 {
+		return func(ctx context.Context, module api.Module, p1, p2 uint32) uint32 {
+			return call(ctx, state, module, p1, p2)
+		}
+	}
+	nop4 := func(call func(context.Context, *s3ClientState, api.Module, uint32, uint32, uint32, uint32) uint32) func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32 {
+		return func(ctx context.Context, module api.Module, p1, p2, p3, p4 uint32) uint32 {
+			return call(ctx, state, module, p1, p2, p3, p4)
+		}
+	}
+	b.NewFunctionBuilder().WithFunc(nop2(s3Put)).Export("s3_put")
+	b.NewFunctionBuilder().WithFunc(nop2(s3PutSized)).Export("s3_put_sized")
+	b.NewFunctionBuilder().WithFunc(nop4(s3PutMultipartInit)).Export("s3_put_multipart_init")
+	b.NewFunctionBuilder().WithFunc(nop4(s3PutMultipartPart)).Export("s3_put_multipart_part")
+	b.NewFunctionBuilder().WithFunc(nop2(s3PutMultipartComplete)).Export("s3_put_multipart_complete")
+	b.NewFunctionBuilder().WithFunc(nop2(s3PutMultipartAbort)).Export("s3_put_multipart_abort")
+	b.NewFunctionBuilder().WithFunc(nop4(s3Presign)).Export("s3_presign")
+	b.NewFunctionBuilder().WithFunc(nop4(s3PresignPut)).Export("s3_presign_put")
+	b.NewFunctionBuilder().WithFunc(nop4(s3Head)).Export("s3_head")
+	b.NewFunctionBuilder().WithFunc(nop4(s3Get)).Export("s3_get")
+	b.NewFunctionBuilder().WithFunc(nop2(s3Copy)).Export("s3_copy")
+	b.NewFunctionBuilder().WithFunc(nop2(s3Delete)).Export("s3_delete")
+	b.NewFunctionBuilder().WithFunc(nop4(s3List)).Export("s3_list")
 	return nil
 }
 
@@ -361,7 +481,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	return nil
 }
 
-func s3Put(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func s3Put(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -373,11 +493,11 @@ func s3Put(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: &bucket,
+	_, err := state.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 		Body:   bytes.NewReader(req.Body),
 	})
@@ -391,7 +511,7 @@ func s3Put(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 // PutObjectInput so the SDK sends a non-chunked, known-length PUT.
 // Mirrors r2.UploadSized — world archive uploads etc. depend on this
 // to avoid aws-chunked transfer-encoding.
-func s3PutSized(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func s3PutSized(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -403,12 +523,12 @@ func s3PutSized(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	size := req.ContentLength
 	in := &s3.PutObjectInput{
-		Bucket:        &bucket,
+		Bucket:        &state.bucket,
 		Key:           &req.Key,
 		Body:          bytes.NewReader(req.Body),
 		ContentLength: &size,
@@ -416,7 +536,7 @@ func s3PutSized(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32
 	if req.ContentType != "" {
 		in.ContentType = &req.ContentType
 	}
-	if _, err := client.PutObject(ctx, in); err != nil {
+	if _, err := state.client.PutObject(ctx, in); err != nil {
 		return classifyS3Error(err)
 	}
 	return 0
@@ -425,7 +545,7 @@ func s3PutSized(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32
 // s3PutMultipartInit begins a multipart upload. The returned upload_id
 // must be passed to every subsequent part/complete/abort call for this
 // key. No bytes are sent yet.
-func s3PutMultipartInit(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3PutMultipartInit(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -437,17 +557,17 @@ func s3PutMultipartInit(ctx context.Context, m api.Module, reqPtr, reqLen, respP
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	in := &s3.CreateMultipartUploadInput{
-		Bucket: &bucket,
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 	}
 	if req.ContentType != "" {
 		in.ContentType = &req.ContentType
 	}
-	out, err := client.CreateMultipartUpload(ctx, in)
+	out, err := state.client.CreateMultipartUpload(ctx, in)
 	if err != nil {
 		return classifyS3Error(err)
 	}
@@ -462,7 +582,7 @@ func s3PutMultipartInit(ctx context.Context, m api.Module, reqPtr, reqLen, respP
 // sends part_number starting at 1; chunks other than the final one must
 // be at least 5 MB (S3/R2 constraint). The returned etag must be passed
 // back in _complete.
-func s3PutMultipartPart(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3PutMultipartPart(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -474,12 +594,12 @@ func s3PutMultipartPart(ctx context.Context, m api.Module, reqPtr, reqLen, respP
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	partNum := req.PartNumber
-	out, err := client.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:     &bucket,
+	out, err := state.client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     &state.bucket,
 		Key:        &req.Key,
 		UploadId:   &req.UploadID,
 		PartNumber: &partNum,
@@ -498,7 +618,7 @@ func s3PutMultipartPart(ctx context.Context, m api.Module, reqPtr, reqLen, respP
 // s3PutMultipartComplete finalizes a multipart upload. Parts must be
 // supplied in ascending part_number order with their etags. After this
 // returns 0 the object is visible at key.
-func s3PutMultipartComplete(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func s3PutMultipartComplete(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -510,7 +630,7 @@ func s3PutMultipartComplete(ctx context.Context, m api.Module, reqPtr, reqLen ui
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	parts := make([]s3types.CompletedPart, 0, len(req.Parts))
@@ -523,8 +643,8 @@ func s3PutMultipartComplete(ctx context.Context, m api.Module, reqPtr, reqLen ui
 			ETag:       &etag,
 		})
 	}
-	_, err := client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   &bucket,
+	_, err := state.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   &state.bucket,
 		Key:      &req.Key,
 		UploadId: &req.UploadID,
 		MultipartUpload: &s3types.CompletedMultipartUpload{
@@ -540,7 +660,7 @@ func s3PutMultipartComplete(ctx context.Context, m api.Module, reqPtr, reqLen ui
 // s3PutMultipartAbort cancels a multipart upload. Any uploaded parts are
 // discarded by R2 (R2 otherwise bills for orphaned parts). Call this
 // whenever _part fails partway so the cell can retry without leaking.
-func s3PutMultipartAbort(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func s3PutMultipartAbort(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -552,11 +672,11 @@ func s3PutMultipartAbort(ctx context.Context, m api.Module, reqPtr, reqLen uint3
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
-	_, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-		Bucket:   &bucket,
+	_, err := state.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   &state.bucket,
 		Key:      &req.Key,
 		UploadId: &req.UploadID,
 	})
@@ -566,7 +686,7 @@ func s3PutMultipartAbort(ctx context.Context, m api.Module, reqPtr, reqLen uint3
 	return 0
 }
 
-func s3PresignPut(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3PresignPut(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -578,15 +698,15 @@ func s3PresignPut(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	ttl := time.Duration(req.TTLSec) * time.Second
 	if ttl <= 0 {
 		ttl = 15 * time.Minute
 	}
-	psr, err := presig.PresignPutObject(ctx, &s3.PutObjectInput{
-		Bucket: &bucket,
+	psr, err := state.presig.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
@@ -595,7 +715,7 @@ func s3PresignPut(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	return writeMsgpackResponse(ctx, m, presignResponse{URL: psr.URL}, respPtrOut, respLenOut)
 }
 
-func s3Presign(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3Presign(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -607,15 +727,15 @@ func s3Presign(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, re
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	ttl := time.Duration(req.TTLSec) * time.Second
 	if ttl <= 0 {
 		ttl = 15 * time.Minute
 	}
-	psr, err := presig.PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket: &bucket,
+	psr, err := state.presig.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
@@ -624,7 +744,7 @@ func s3Presign(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, re
 	return writeMsgpackResponse(ctx, m, presignResponse{URL: psr.URL}, respPtrOut, respLenOut)
 }
 
-func s3Head(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3Head(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -636,11 +756,11 @@ func s3Head(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respL
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
-	out, err := client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: &bucket,
+	out, err := state.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 	})
 	if err != nil {
@@ -659,7 +779,7 @@ func s3Head(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respL
 // s3Get fetches an object's whole body. Use only for small objects —
 // the body is held in host memory, msgpack-encoded, then copied into
 // cell memory. For large downloads use s3_presign instead.
-func s3Get(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3Get(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -671,11 +791,11 @@ func s3Get(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLe
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
-	out, err := client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &bucket,
+	out, err := state.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 	})
 	if err != nil {
@@ -699,7 +819,7 @@ func s3Get(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLe
 	return writeMsgpackResponse(ctx, m, resp, respPtrOut, respLenOut)
 }
 
-func s3Copy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func s3Copy(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -711,12 +831,12 @@ func s3Copy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
-	copySource := bucket + "/" + url.PathEscape(req.SrcKey)
-	_, err := client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     &bucket,
+	copySource := state.bucket + "/" + url.PathEscape(req.SrcKey)
+	_, err := state.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     &state.bucket,
 		CopySource: &copySource,
 		Key:        &req.DstKey,
 	})
@@ -726,7 +846,7 @@ func s3Copy(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	return 0
 }
 
-func s3Delete(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func s3Delete(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -738,11 +858,11 @@ func s3Delete(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
-	_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: &bucket,
+	_, err := state.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &state.bucket,
 		Key:    &req.Key,
 	})
 	if err != nil {
@@ -751,7 +871,7 @@ func s3Delete(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	return 0
 }
 
-func s3List(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func s3List(ctx context.Context, state *s3ClientState, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -763,11 +883,11 @@ func s3List(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respL
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureClient(); err != nil {
+	if err := state.ensureClient(); err != nil {
 		return 10
 	}
 	in := &s3.ListObjectsV2Input{
-		Bucket: &bucket,
+		Bucket: &state.bucket,
 	}
 	if req.Prefix != "" {
 		in.Prefix = &req.Prefix
@@ -779,7 +899,7 @@ func s3List(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respL
 		mk := req.MaxKeys
 		in.MaxKeys = &mk
 	}
-	out, err := client.ListObjectsV2(ctx, in)
+	out, err := state.client.ListObjectsV2(ctx, in)
 	if err != nil {
 		return classifyS3Error(err)
 	}

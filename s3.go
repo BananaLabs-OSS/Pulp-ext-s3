@@ -137,6 +137,7 @@ func classifyS3Error(err error) uint32 {
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "storage.s3",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-s3",
 		Setup:         setup,
 		Register:      bindActive,
 		Stub:          bindStub,

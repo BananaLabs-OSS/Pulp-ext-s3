@@ -17,6 +17,28 @@ import (
 	"github.com/aws/smithy-go"
 )
 
+func TestCapabilityRegistrationsCarryProviderIdentity(t *testing.T) {
+	const provider = "github.com/BananaLabs-OSS/Pulp-ext-s3"
+	want := map[string]bool{
+		"storage.s3":           false,
+		PublicUploadCapability: false,
+	}
+	for _, capability := range ext.All() {
+		if _, ok := want[capability.Name]; !ok {
+			continue
+		}
+		if capability.Provider != provider {
+			t.Fatalf("%s provider = %q, want %q", capability.Name, capability.Provider, provider)
+		}
+		want[capability.Name] = true
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("%s capability is not registered", name)
+		}
+	}
+}
+
 // getInput builds a GetObjectInput against the configured test bucket.
 func getInput(key string) *s3.GetObjectInput {
 	state, _ := manager.forScope(ext.LegacyScope("default"))

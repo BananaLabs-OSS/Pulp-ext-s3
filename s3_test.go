@@ -3,20 +3,46 @@ package s3ext
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 )
 
+func TestCapabilityRegistrationsCarryProviderIdentity(t *testing.T) {
+	const provider = "github.com/BananaLabs-OSS/Pulp-ext-s3"
+	want := map[string]bool{
+		"storage.s3":           false,
+		PublicUploadCapability: false,
+	}
+	for _, capability := range ext.All() {
+		if _, ok := want[capability.Name]; !ok {
+			continue
+		}
+		if capability.Provider != provider {
+			t.Fatalf("%s provider = %q, want %q", capability.Name, capability.Provider, provider)
+		}
+		want[capability.Name] = true
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("%s capability is not registered", name)
+		}
+	}
+}
+
 // getInput builds a GetObjectInput against the configured test bucket.
 func getInput(key string) *s3.GetObjectInput {
-	return &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}
+	state, _ := manager.forScope(ext.LegacyScope("default"))
+	return &s3.GetObjectInput{Bucket: aws.String(state.bucket), Key: aws.String(key)}
 }
 
 // resetClient clears the package-global client state so each test drives
@@ -24,12 +50,16 @@ func getInput(key string) *s3.GetObjectInput {
 // (client != nil) and failure (initErr), so both must be cleared.
 func resetClient(t *testing.T) {
 	t.Helper()
-	clientMu.Lock()
-	client = nil
-	presig = nil
-	bucket = ""
-	initErr = nil
-	clientMu.Unlock()
+	manager = newS3Manager()
+}
+
+func legacyState(t *testing.T) *s3ClientState {
+	t.Helper()
+	state, err := manager.forScope(ext.LegacyScope("default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 // setEnv sets S3_* env vars for the duration of a test (auto-restored).
@@ -56,9 +86,9 @@ func setEnv(t *testing.T, kv map[string]string) {
 func TestEnsureClientRequiresCredentials(t *testing.T) {
 	cases := []map[string]string{
 		{}, // nothing set
-		{"S3_ACCESS_KEY_ID": "ak", "S3_SECRET_ACCESS_KEY": "sk"},                       // no bucket
-		{"S3_ACCESS_KEY_ID": "ak", "S3_BUCKET": "b"},                                   // no secret
-		{"S3_SECRET_ACCESS_KEY": "sk", "S3_BUCKET": "b"},                               // no access key
+		{"S3_ACCESS_KEY_ID": "ak", "S3_SECRET_ACCESS_KEY": "sk"}, // no bucket
+		{"S3_ACCESS_KEY_ID": "ak", "S3_BUCKET": "b"},             // no secret
+		{"S3_SECRET_ACCESS_KEY": "sk", "S3_BUCKET": "b"},         // no access key
 	}
 	for i, env := range cases {
 		resetClient(t)
@@ -66,9 +96,7 @@ func TestEnsureClientRequiresCredentials(t *testing.T) {
 		if err := ensureClient(); err == nil {
 			t.Errorf("case %d: ensureClient succeeded with missing creds %v", i, env)
 		}
-		clientMu.Lock()
-		c := client
-		clientMu.Unlock()
+		c := legacyState(t).client
 		if c != nil {
 			t.Errorf("case %d: client built despite missing creds", i)
 		}
@@ -108,7 +136,7 @@ func TestEnsureClientBuildsR2EndpointFromAccount(t *testing.T) {
 	if err := ensureClient(); err != nil {
 		t.Fatalf("ensureClient: %v", err)
 	}
-	if bucket != "worlds" {
+	if bucket := legacyState(t).bucket; bucket != "worlds" {
 		t.Fatalf("bucket = %q, want worlds (R2_BUCKET fallback)", bucket)
 	}
 	// A presign should target the R2 endpoint derived from the account id.
@@ -252,7 +280,7 @@ func TestPresignDefaultTTL(t *testing.T) {
 	if err := ensureClient(); err != nil {
 		t.Fatalf("ensureClient: %v", err)
 	}
-	psr, err := presig.PresignGetObject(context.Background(), getInput("k"))
+	psr, err := legacyState(t).presig.PresignGetObject(context.Background(), getInput("k"))
 	if err != nil {
 		t.Fatalf("presign: %v", err)
 	}
@@ -283,10 +311,111 @@ func TestCopySourceScoping(t *testing.T) {
 	// Reproduce that expression against the configured bucket and assert it
 	// stays bucket-scoped even when the cell supplies a crafted src key.
 	for _, srcKey := range []string{"a/b.txt", "../evil", "other-bucket/x"} {
-		copySource := bucket + "/" + srcKey
+		copySource := legacyState(t).bucket + "/" + srcKey
 		if !strings.HasPrefix(copySource, "thebucket/") {
 			t.Errorf("copy source %q escaped configured bucket prefix", copySource)
 		}
+	}
+}
+
+func scopedS3(t *testing.T, app, instance, cell string) ext.Scope {
+	t.Helper()
+	scope, err := ext.NewScope(app, instance, cell, "primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scope
+}
+
+func TestTwoApplicationClientLifecycle(t *testing.T) {
+	manager = newS3Manager()
+	setEnv(t, map[string]string{
+		"S3_ACCESS_KEY_ID":     "fake-access",
+		"S3_SECRET_ACCESS_KEY": "fake-secret",
+		"S3_BUCKET":            "test-bucket",
+		"S3_ENDPOINT":          "https://s3.test",
+	})
+	evolution := scopedS3(t, "evolution", "blue", "host")
+	sessions := scopedS3(t, "sessions", "green", "host")
+	left, err := manager.setup(evolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := manager.setup(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left == right {
+		t.Fatal("two applications share an S3 client state")
+	}
+	if err := left.ensureClient(); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.ensureClient(); err != nil {
+		t.Fatal(err)
+	}
+	if left.client == right.client || left.presig == right.presig {
+		t.Fatal("two applications share mutable AWS SDK clients")
+	}
+	if err := manager.teardown(evolution); err != nil {
+		t.Fatal(err)
+	}
+	if err := left.ensureClient(); err == nil {
+		t.Fatal("torn-down application reused its client")
+	}
+	if err := right.ensureClient(); err != nil {
+		t.Fatalf("Evolution teardown interrupted Sessions: %v", err)
+	}
+	if err := manager.teardown(evolution); err != nil {
+		t.Fatalf("repeated teardown is not idempotent: %v", err)
+	}
+	if _, err := manager.forScope(scopedS3(t, "evolution", "blue", "storage")); err == nil {
+		t.Fatal("scoped client recreated without Setup")
+	}
+}
+
+func TestTwoApplicationClientLifecycleRace(t *testing.T) {
+	manager = newS3Manager()
+	evolution := scopedS3(t, "evolution", "blue", "host")
+	sessions := scopedS3(t, "sessions", "green", "host")
+	if _, err := manager.setup(sessions); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if _, err := manager.setup(evolution); err != nil {
+				errCh <- err
+				return
+			}
+			if err := manager.teardown(evolution); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			first, err := manager.forScope(sessions)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			second, err := manager.forScope(sessions)
+			if err != nil || first != second {
+				errCh <- fmt.Errorf("Sessions client state changed during Evolution lifecycle: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
 	}
 }
 
@@ -294,7 +423,7 @@ func TestCopySourceScoping(t *testing.T) {
 
 func presignGet(t *testing.T, key string) *url.URL {
 	t.Helper()
-	psr, err := presig.PresignGetObject(context.Background(), getInput(key))
+	psr, err := legacyState(t).presig.PresignGetObject(context.Background(), getInput(key))
 	if err != nil {
 		t.Fatalf("PresignGetObject(%q): %v", key, err)
 	}

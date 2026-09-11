@@ -1,6 +1,6 @@
 module github.com/BananaLabs-OSS/Pulp-ext-s3
 
-go 1.25.6
+go 1.25.13
 
 require (
 	github.com/BananaLabs-OSS/Fiber v0.0.0

@@ -3,6 +3,7 @@ module github.com/BananaLabs-OSS/Pulp-ext-s3
 go 1.25.6
 
 require (
+	github.com/BananaLabs-OSS/Fiber v0.0.0
 	github.com/BananaLabs-OSS/Pulp v0.0.0
 	github.com/aws/aws-sdk-go-v2 v1.41.2
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.10
@@ -25,4 +26,7 @@ require (
 	golang.org/x/sys v0.42.0 // indirect
 )
 
-replace github.com/BananaLabs-OSS/Pulp => ../Pulp
+replace (
+	github.com/BananaLabs-OSS/Fiber => ../Fiber
+	github.com/BananaLabs-OSS/Pulp => ../Pulp
+)
